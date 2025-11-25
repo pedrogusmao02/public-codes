@@ -1,0 +1,386 @@
+{%- doc -%}
+  Renders shipping estimation calculation form
+  
+  Accepts:
+  - section_id: {String} Section ID for unique form IDs
+  
+  Usage:
+  {% render 'shipping-estimation-calculation', section_id: section.id %}
+  
+  Note: 
+ - data-provinces attribute comes from Shopify's all_country_option_tags Liquid tag
+  - No external dependencies, fully self-contained
+{%- enddoc -%}
+
+<form action="{{ routes.cart_url }}" method="POST" novalidate is="shipping-estimation-calculator" data-section-id="{{ section_id }}">
+  <div>
+    <label for="ShippingEstimationCountry-{{ section_id }}">Country</label>
+    <select
+      name="address[country]"
+      autocomplete="country"
+      id="ShippingEstimationCountry-{{ section_id }}"
+      data-shipping-field="shipping_address[country]"
+      required
+    >
+      {{- all_country_option_tags -}}
+    </select>
+  </div>
+  <div id="ShippingEstimationProvinceContainer-{{ section_id }}" hidden>
+    <label for="ShippingEstimationProvince-{{ section_id }}">Province</label>
+    <select
+      name="address[province]"
+      autocomplete="address-level1"
+      id="ShippingEstimationProvince-{{ section_id }}"
+      data-shipping-field="shipping_address[province]"
+    >
+    </select>
+  </div>
+  <div>
+    <label for="ShippingEstimationZip-{{ section_id }}">Zip Code</label>
+    <input
+      name="address[zip]"
+      type="text"
+      autocapitalize="characters"
+      autocomplete="postal-code"
+      id="ShippingEstimationZip-{{ section_id }}"
+      data-shipping-field="shipping_address[zip]"
+      {% if shop.customer_accounts_enabled and customer %}value="{{ customer.default_address.zip }}"{% endif %}
+      required
+    />
+  </div>
+  <div>
+    <button type="submit" class="btn">Calculate</button>
+  </div>
+  <div class="shipping-estimation-results" hidden></div>
+</form>
+
+<script>
+(function() {
+  // Handle country-province dropdown logic
+  // Shopify's all_country_option_tags adds data-provinces attribute to each country option
+  // This contains JSON array of [code, name] pairs for provinces/states
+  function setupCountryProvince(form) {
+    const countrySelect = form.querySelector('[name="address[country]"]');
+    const provinceSelect = form.querySelector('[name="address[province]"]');
+    const provinceContainer = form.querySelector('[id^="ShippingEstimationProvinceContainer"]');
+    
+    if (!countrySelect || !provinceSelect || !provinceContainer) return;
+    
+    function updateProvinceOptions() {
+      const selectedOption = countrySelect.options[countrySelect.selectedIndex];
+      const provincesData = selectedOption.getAttribute('data-provinces');
+      
+      if (!provincesData) {
+        provinceContainer.hidden = true;
+        return;
+      }
+      
+      try {
+        const provinces = JSON.parse(provincesData);
+        provinceContainer.hidden = provinces.length === 0;
+        
+        if (provinces.length === 0) {
+          return;
+        }
+        
+        provinceSelect.innerHTML = '';
+        provinces.forEach(function(provinceData) {
+          const option = new Option(provinceData[1], provinceData[0]);
+          provinceSelect.options.add(option);
+        });
+      } catch (e) {
+        console.error('Shipping Estimation: Error parsing provinces:', e);
+        provinceContainer.hidden = true;
+      }
+    }
+    
+    countrySelect.addEventListener('change', updateProvinceOptions);
+    updateProvinceOptions();
+  }
+
+  // customElements is a native browser Web API for creating custom HTML elements
+  // See: https://developer.mozilla.org/en-US/docs/Web/API/CustomElementRegistry
+  if (!customElements.get('shipping-estimation-calculator')) {
+    customElements.define(
+      'shipping-estimation-calculator',
+      class ShippingEstimationCalculator extends HTMLFormElement {
+        constructor() {
+          super();
+          this.onSubmitHandler = this.onSubmit.bind(this);
+          this.pollInterval = null;
+          this.maxPollTime = 15000;
+          this.pollStartTime = null;
+        }
+
+        connectedCallback() {
+          this.submitButton = this.querySelector('[type="submit"]');
+          this.resultsElement = this.querySelector('.shipping-estimation-results');
+          this.submitButton.addEventListener('click', this.onSubmitHandler);
+          setupCountryProvince(this);
+        }
+
+        disconnectedCallback() {
+          this.submitButton.removeEventListener('click', this.onSubmitHandler);
+          this.stopPolling();
+        }
+
+        async checkCartHasItems() {
+          const cartUrl = (window.theme && window.theme.routes && window.theme.routes.cart_url) || '{{ routes.cart_url }}';
+          try {
+            const response = await fetch(`${cartUrl}.json`, {
+              method: 'GET',
+              headers: { 'Accept': 'application/json' }
+            });
+            if (response.ok) {
+              const cartData = await response.json();
+              return cartData.item_count > 0;
+            }
+            return false;
+          } catch (error) {
+            console.error('Shipping Estimation: Error checking cart:', error);
+            return false;
+          }
+        }
+
+        async onSubmit(event) {
+          event.preventDefault();
+
+          this.abortController?.abort();
+          this.abortController = new AbortController();
+
+          const zipField = this.querySelector('[data-shipping-field="shipping_address[zip]"]') || this.querySelector('[name="address[zip]"]');
+          const countryField = this.querySelector('[data-shipping-field="shipping_address[country]"]') || this.querySelector('[name="address[country]"]');
+          const provinceField = this.querySelector('[data-shipping-field="shipping_address[province]"]') || this.querySelector('[name="address[province]"]');
+          
+          const zip = zipField.value;
+          const country = countryField.value;
+          const province = provinceField.value;
+
+          this.submitButton.setAttribute('aria-busy', 'true');
+          this.resultsElement.hidden = true;
+          this.resultsElement.innerHTML = '';
+
+          const hasItems = await this.checkCartHasItems();
+          if (!hasItems) {
+            this.submitButton.removeAttribute('aria-busy');
+            this.showError('Your cart is empty. Please add items to your cart before calculating shipping rates.');
+            return;
+          }
+
+          const shippingAddress = {
+            zip: zip,
+            country: country
+          };
+          if (province) {
+            shippingAddress.province = province;
+          }
+
+          const cartUrl = (window.theme && window.theme.routes && window.theme.routes.cart_url) || '{{ routes.cart_url }}';
+          let prepareUrl = `${cartUrl}/prepare_shipping_rates.json`;
+          prepareUrl = prepareUrl.replace('//', '/');
+
+          fetch(prepareUrl, { 
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            body: JSON.stringify({ shipping_address: shippingAddress }),
+            signal: this.abortController.signal 
+          })
+            .then(async (response) => {
+              if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`HTTP ${response.status}: ${errorText || response.statusText}`);
+              }
+              
+              const text = await response.text();
+              if (!text || text.trim() === '') {
+                return { success: true };
+              }
+              try {
+                return JSON.parse(text);
+              } catch (e) {
+                return { success: true };
+              }
+            })
+            .then((result) => {
+              setTimeout(() => {
+                this.startPolling();
+              }, 500);
+            })
+            .catch((error) => {
+              if (error.name === 'AbortError') {
+                console.log('Shipping Estimation: Fetch aborted by user');
+              }
+              else {
+                console.error('Shipping Estimation: Error preparing shipping rates:', error);
+                this.showError('Shipping Estimation: Failed to prepare shipping rates. Please ensure your cart has items and try again.');
+              }
+              this.submitButton.removeAttribute('aria-busy');
+            });
+        }
+
+        startPolling() {
+          this.pollStartTime = Date.now();
+          let attemptCount = 0;
+
+          this.pollInterval = setInterval(() => {
+            attemptCount++;
+            const elapsed = Date.now() - this.pollStartTime;
+
+            this.resultsElement.hidden = false;
+            this.resultsElement.innerHTML = `
+              <div class="alert alert--info grid gap-2 text-sm leading-tight">
+                <p>Checking shipping rates... (Attempt ${attemptCount})</p>
+              </div>
+            `;
+
+            const cartUrl = (window.theme && window.theme.routes && window.theme.routes.cart_url) || '{{ routes.cart_url }}';
+            let asyncUrl = `${cartUrl}/async_shipping_rates.json`;
+            asyncUrl = asyncUrl.replace('//', '/');
+
+            fetch(asyncUrl, { 
+              method: 'GET',
+              headers: { 'Accept': 'application/json' },
+              signal: this.abortController.signal 
+            })
+              .then(async (response) => {
+                if (response.status === 422) {
+                  const errorText = await response.text();
+                  let errorData;
+                  try {
+                    errorData = JSON.parse(errorText);
+                  } catch (e) {
+                    errorData = { error: ['Unable to calculate shipping rates. Please ensure your cart has items.'] };
+                  }
+                  const error = new Error('422');
+                  error.errorData = errorData;
+                  throw error;
+                }
+                
+                if (!response.ok) {
+                  const errorText = await response.text();
+                  throw new Error(`HTTP ${response.status}: ${errorText || response.statusText}`);
+                }
+                
+                const text = await response.text();
+                if (!text || text.trim() === '') {
+                  return { status: 'pending' };
+                }
+                try {
+                  return JSON.parse(text);
+                } catch (e) {
+                  return { status: 'pending' };
+                }
+              })
+              .then((parsedState) => {
+                if (parsedState.shipping_rates && parsedState.shipping_rates.length > 0) {
+                  this.stopPolling();
+                  this.formatShippingRates(parsedState.shipping_rates);
+                  this.submitButton.removeAttribute('aria-busy');
+                }
+                else if (parsedState.status === 'error' || parsedState.errors) {
+                  this.stopPolling();
+                  this.formatError(parsedState.errors || parsedState);
+                  this.submitButton.removeAttribute('aria-busy');
+                }
+                else if (elapsed >= this.maxPollTime) {
+                  this.stopPolling();
+                  this.showError('Shipping rate calculation is taking longer than expected. Please try again.');
+                  this.submitButton.removeAttribute('aria-busy');
+                }
+              })
+              .catch((error) => {
+                if (error.name === 'AbortError') {
+                  console.log('Fetch aborted by user');
+                  this.stopPolling();
+                }
+                else {
+                  console.error('Error fetching shipping rates:', error);
+                  
+                  if (error.errorData) {
+                    this.stopPolling();
+                    this.formatError(error.errorData);
+                    this.submitButton.removeAttribute('aria-busy');
+                  }
+                  else if (elapsed >= this.maxPollTime || error.message.includes('422')) {
+                    this.stopPolling();
+                    this.showError('Unable to calculate shipping rates. Please ensure your cart has items and try again.');
+                    this.submitButton.removeAttribute('aria-busy');
+                  }
+                }
+              });
+          }, 1000);
+        }
+
+        stopPolling() {
+          if (this.pollInterval) {
+            clearInterval(this.pollInterval);
+            this.pollInterval = null;
+          }
+        }
+
+        showError(message) {
+          this.resultsElement.hidden = false;
+          this.resultsElement.innerHTML = `
+            <div class="alert alert--error grid gap-2 text-sm leading-tight">
+              <p>${message}</p>
+            </div>
+          `;
+        }
+
+        formatError(errors) {
+          let errorMessages = '';
+          
+          if (errors && typeof errors === 'object') {
+            if (errors.error && Array.isArray(errors.error)) {
+              errorMessages = errors.error.map(msg => `<li>${msg}</li>`).join('');
+            }
+            else {
+              errorMessages = Object.keys(errors).map((errorKey) => {
+                const value = errors[errorKey];
+                if (Array.isArray(value)) {
+                  return value.map(msg => `<li>${msg}</li>`).join('');
+                }
+                return `<li>${value}</li>`;
+              }).join('');
+            }
+          } else {
+            errorMessages = `<li>${errors || 'An error occurred'}</li>`;
+          }
+          
+          this.resultsElement.innerHTML = `
+            <div class="alert alert--error grid gap-2 text-sm leading-tight">
+              <p>Error</p>
+              ${errorMessages ? `<ul class="list-disc grid gap-2" role="list">${errorMessages}</ul>` : ''}
+            </div>
+          `;
+        }
+
+        formatShippingRates(shippingRates) {
+          const shippingRatesList = shippingRates.map(({ presentment_name, currency, price }) => {
+            return `<li>${presentment_name}: ${currency} ${price}</li>`;
+          });
+          
+          let message = '';
+          if (shippingRates.length === 0) {
+            message = 'No shipping rates found';
+          } else if (shippingRates.length === 1) {
+            message = 'One shipping rate found';
+          } else {
+            message = 'Multiple shipping rates found';
+          }
+          
+          this.resultsElement.innerHTML = `
+            <div class="alert alert--${shippingRates.length === 0 ? 'error' : 'success'} grid gap-2 text-sm leading-tight">
+              <p>${message}</p>
+              ${shippingRatesList.length === 0 ? '' : `<ul class="list-disc grid gap-2" role="list">${shippingRatesList.join('')}</ul>`}
+            </div>
+          `;
+        }
+      }, { extends: 'form' }
+    );
+  }
+})();
+</script>
